@@ -1,0 +1,6 @@
+domain: example.org
+layout: go.kubebuilder.io/v2
+repo: github.com/dimitar-kostadinov/example-operator
+version: 3-alpha
+plugins:
+  go.operator-sdk.io/v2-alpha: {}
