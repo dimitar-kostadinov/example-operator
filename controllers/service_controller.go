@@ -46,7 +46,7 @@ type Server struct {
 	minikubeIP string
 	port       int32
 	nodePort   int32
-	done       chan interface{}
+	done       chan struct{}
 	wg         sync.WaitGroup
 }
 
@@ -185,7 +185,7 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 				minikubeIP: minikubeIP,
 				port:       port,
 				nodePort:   nodePort,
-				done:       make(chan interface{}),
+				done:       make(chan struct{}),
 			}
 			servers[req.NamespacedName.String()] = server
 			server.wg.Add(1)
@@ -200,7 +200,7 @@ func (r *ServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		}
 		if !reflect.DeepEqual(loadBalancer, service.Status.LoadBalancer) {
 			log.Info("updating LoadBalancer status")
-			// The obj returned in r.Get is supposed to be a deep copy of the cache object, however this comment is disturbing
+			// The obj returned in r.Get is supposed to be a deep copy of the cache object, however this comment is suspicious
 			// https://github.com/kubernetes-sigs/controller-runtime/blob/b2c90ab82af89fb84120108af14f4ade9df5d787/pkg/cache/internal/cache_reader.go#L84
 			service.Status.LoadBalancer = loadBalancer
 			err := r.Status().Update(ctx, service)
