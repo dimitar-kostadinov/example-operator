@@ -1,6 +1,15 @@
-domain: example.org
-layout: go.kubebuilder.io/v2
-repo: github.com/dimitar-kostadinov/example-operator
-version: 3-alpha
+domain: example.com
+layout:
+- go.kubebuilder.io/v3
 plugins:
-  go.operator-sdk.io/v2-alpha: {}
+  manifests.sdk.operatorframework.io/v2: {}
+  scorecard.sdk.operatorframework.io/v2: {}
+projectName: tst
+repo: github.com/dimitar-kostadinov/example-operator
+resources:
+- controller: true
+  group: core
+  kind: Service
+  path: k8s.io/api/core/v1
+  version: v1
+version: "3"

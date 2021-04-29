@@ -26,24 +26,25 @@ var _ = Describe("Kubernetes operator - controller test", func() {
 	const targetPort = 8080
 
 	var (
-		err  error
-		ctx  context.Context
-		name string
-		port int32
-		rep  *int32
-		done chan struct{}
-		depl *appsv1.Deployment
-		srv  *corev1.Service
-		mgr  manager.Manager
+		err    error
+		ctx    context.Context
+		mgrCtx context.Context
+		cancel context.CancelFunc
+		name   string
+		port   int32
+		rep    *int32
+		depl   *appsv1.Deployment
+		srv    *corev1.Service
+		mgr    manager.Manager
 	)
 
 	BeforeEach(func() {
 		ctx = context.Background()
+		mgrCtx, cancel = context.WithCancel(context.Background())
 		name = "hello-minikube-test"
 		port = 30080
 		rep = new(int32)
 		*rep = 1
-		done = make(chan struct{})
 		labels := map[string]string{"app": name}
 		depl = &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
@@ -107,7 +108,7 @@ var _ = Describe("Kubernetes operator - controller test", func() {
 		Expect(err).ToNot(HaveOccurred())
 		By("start manager")
 		go func() {
-			err = mgr.Start(done)
+			err = mgr.Start(mgrCtx)
 			Expect(err).ToNot(HaveOccurred())
 		}()
 		time.Sleep(time.Second)
@@ -115,7 +116,7 @@ var _ = Describe("Kubernetes operator - controller test", func() {
 
 	JustAfterEach(func() {
 		By("stop manager")
-		close(done)
+		cancel()
 	})
 
 	It("should access exposed deployment", func() {
