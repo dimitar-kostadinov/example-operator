@@ -18,38 +18,69 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/go-logr/logr"
 	"io"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"net"
 	"reflect"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sync"
 )
 
-const minikubeNodeName = "minikube"
+const (
+	minikubeNodeName = "minikube"
+	serviceFinalizer = "service.example-operator.com/finalizer"
+)
 
 var (
 	machineIP string
 	// map contains service NamespacedName -> Server
 	servers = make(map[string]*Server)
+	// thread safe lock for servers map access (controller.MaxConcurrentReconciles may be set > 1)
+	mux = sync.RWMutex{}
 )
 
+// servers map operations
+func getServer(key string) (srv *Server, ok bool) {
+	mux.RLock()
+	defer mux.RUnlock()
+	srv, ok = servers[key]
+	return
+}
+
+func addServer(key string, srv *Server) {
+	mux.Lock()
+	mux.Unlock()
+	servers[key] = srv
+}
+
+func deleteServer(key string) {
+	mux.Lock()
+	mux.Unlock()
+	delete(servers, key)
+}
+
+// Server type & functions
 type Server struct {
 	log        logr.Logger
 	listener   net.Listener
+	dialer     net.Dialer
 	minikubeIP string
-	port       int32
+	port       int
 	nodePort   int32
-	done       chan struct{}
 	wg         sync.WaitGroup
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
+// start listening on machineIP : port
 func (s *Server) serve() {
 	defer s.wg.Done()
 	s.log.Info(fmt.Sprintf("server listen on port %d", s.port))
@@ -57,8 +88,9 @@ func (s *Server) serve() {
 		c, err := s.listener.Accept()
 		if err != nil {
 			select {
-			case <-s.done:
-				return // chan is closed
+			case <-s.ctx.Done():
+				s.log.Info(fmt.Sprintf("context done: %v", s.ctx.Err()))
+				return
 			default:
 				s.log.Error(err, "could not accept client connection")
 				continue
@@ -69,6 +101,7 @@ func (s *Server) serve() {
 	}
 }
 
+// dail minikubeIP : nodePort and start forward the traffic
 func (s *Server) handler(c net.Conn) {
 	log := s.log.WithValues("connection", c)
 
@@ -80,7 +113,7 @@ func (s *Server) handler(c net.Conn) {
 		}
 	}()
 
-	target, err := net.Dial("tcp", fmt.Sprintf("%s:%d", s.minikubeIP, s.nodePort))
+	target, err := s.dialer.DialContext(s.ctx, "tcp", fmt.Sprintf("%s:%d", s.minikubeIP, s.nodePort))
 	if err != nil {
 		log.Error(err, "could not connect to target")
 		return
@@ -105,14 +138,28 @@ func (s *Server) handler(c net.Conn) {
 	}
 }
 
-func (s *Server) stop() {
-	s.log.Info("stopping server")
-	close(s.done)
+// stop the server
+// cancel server ctx & invoke cleanup with server ctx
+func (s *Server) stop() error {
+	s.log.Info("stopping server ...")
+	defer s.log.Info("server stopped")
+	s.cancel()
+	return s.cleanup(s.ctx)
+}
+
+// wait for ctx done, close the listener
+// and wait for active connections to complete
+// returns err if listener close fails
+func (s *Server) cleanup(ctx context.Context) error {
+	<-ctx.Done()
 	err := s.listener.Close()
-	if err != nil {
+	if err != nil && !errors.Is(err, net.ErrClosed) {
 		s.log.Error(err, "could not close listener")
+		return err
 	}
 	s.wg.Wait()
+	s.log.Info("end close")
+	return nil
 }
 
 // ServiceReconciler reconciles a Service object
@@ -141,85 +188,108 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	key := req.NamespacedName.String()
 	service := &corev1.Service{}
 	if err := r.Get(ctx, req.NamespacedName, service); err != nil {
-		if errors.IsNotFound(err) {
-			// Request object not found, could have been deleted after reconcile request.
-			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
-			// Return and don't requeue
-			log.Info("Service resource not found. Ignoring since object must be deleted")
-			if server, ok := servers[key]; ok {
-				delete(servers, key)
-				server.stop()
-			}
+		if apierrs.IsNotFound(err) {
+			log.Info("resource not found")
+			// we'll ignore not-found errors, since they can't be fixed by an immediate
+			// requeue (we'll need to wait for a new notification), and we can get them
+			// on deleted requests.
 			return ctrl.Result{}, nil
 		}
-		// Error reading the object - requeue the request.
-		log.Error(err, "Failed to get Service")
+		log.Error(err, "unable to fetch Service")
 		return ctrl.Result{}, err
 	}
 
 	if service.Spec.Type == corev1.ServiceTypeLoadBalancer {
-		// init machine IP
-		if len(machineIP) == 0 {
-			ip, err := getMachineIP()
-			if err != nil {
-				log.Error(err, "get machine IP")
-				return ctrl.Result{}, err
+		// first check if DeletionTimestamp is set
+		if service.ObjectMeta.DeletionTimestamp != nil {
+			log.Info("Service resource is marked for deletion")
+			if controllerutil.ContainsFinalizer(service, serviceFinalizer) {
+				// our finalizer is present, so lets handle any external dependency
+				if err := r.finalizeService(key); err != nil {
+					// if fail to delete the external dependency here, return with error
+					// so that it can be retried
+					return ctrl.Result{}, err
+				}
+				// remove our finalizer from the list and update it.
+				controllerutil.RemoveFinalizer(service, serviceFinalizer)
+				if err := r.Update(ctx, service); err != nil {
+					return ctrl.Result{}, err
+				}
 			}
-			machineIP = ip
-		}
-		// check is server is already created
-		if server, ok := servers[key]; ok {
-			log.Info(fmt.Sprintf("server already created %+v", server))
+			// Stop reconciliation as the item is being deleted
+			return ctrl.Result{}, nil
 		} else {
-			// get minikube node IP
-			var node corev1.Node
-			if err := r.Get(ctx, types.NamespacedName{Name: minikubeNodeName}, &node); err != nil {
-				log.Error(err, "Failed to get minikube Node")
+			// The object is not being deleted, so if it does not have our finalizer,
+			// then lets add the finalizer and update the object. This is equivalent
+			// registering our finalizer.
+			if !controllerutil.ContainsFinalizer(service, serviceFinalizer) {
+				controllerutil.AddFinalizer(service, serviceFinalizer)
+				if err := r.Update(ctx, service); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+		}
+
+		// init machine IP
+		if err := initMachineIP(log); err != nil {
+			log.Error(err, "initialize machine IP")
+			return ctrl.Result{}, err
+		}
+		// get minikube node IP
+		var node corev1.Node
+		if err := r.Get(ctx, types.NamespacedName{Namespace: "", Name: minikubeNodeName}, &node); err != nil {
+			log.Error(err, "failed to get minikube Node")
+			return ctrl.Result{}, err
+		}
+		if len(node.Status.Addresses) == 0 || len(node.Status.Addresses[0].Address) == 0 {
+			err := errors.New("minikube Node address not yet set")
+			log.Error(err, "get minikube IP")
+			return ctrl.Result{}, err
+		}
+		minikubeIP := node.Status.Addresses[0].Address
+		log.Info(fmt.Sprintf("minikube Node IP: %s", minikubeIP))
+		// get node port
+		if len(service.Spec.Ports) == 0 || service.Spec.Ports[0].NodePort == 0 {
+			err := errors.New("node port not yet set")
+			log.Error(err, "get service node port")
+			return ctrl.Result{}, err
+		}
+		nodePort := service.Spec.Ports[0].NodePort
+		log.Info(fmt.Sprintf("service node port: %d", nodePort))
+
+		// check if server is already created
+		if server, ok := getServer(key); ok {
+			log.Info("server already created")
+			updateServer(log, server, minikubeIP, nodePort)
+		} else {
+			log.Info("create and start server")
+			if err := createServer(ctx, log, minikubeIP, nodePort, key); err != nil {
 				return ctrl.Result{}, err
 			}
-			minikubeIP := node.Status.Addresses[0].Address
-			// get port & node port
-			port := service.Spec.Ports[0].Port
-			nodePort := service.Spec.Ports[0].NodePort
-			log.Info(fmt.Sprintf("port: %d & node-port: %d", port, nodePort))
-			// listener
-			listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", machineIP, port))
-			if err != nil {
-				log.Error(err, "open port")
-				return ctrl.Result{}, err
-			}
-			server = &Server{
-				log:        log.WithName("server"),
-				listener:   listener,
-				minikubeIP: minikubeIP,
-				port:       port,
-				nodePort:   nodePort,
-				done:       make(chan struct{}),
-			}
-			servers[req.NamespacedName.String()] = server
-			server.wg.Add(1)
-			go server.serve()
 		}
 
 		// update LoadBalancer service status
-		loadBalancer := corev1.LoadBalancerStatus{
+		lbStatus := corev1.LoadBalancerStatus{
 			Ingress: []corev1.LoadBalancerIngress{{
 				IP: machineIP,
 			}},
 		}
-		if !reflect.DeepEqual(loadBalancer, service.Status.LoadBalancer) {
+		if !reflect.DeepEqual(lbStatus, service.Status.LoadBalancer) {
 			log.Info("updating LoadBalancer status")
 			// The obj returned in r.Get is supposed to be a deep copy of the cache object, however this comment is suspicious
 			// https://github.com/kubernetes-sigs/controller-runtime/blob/b2c90ab82af89fb84120108af14f4ade9df5d787/pkg/cache/internal/cache_reader.go#L84
-			service.Status.LoadBalancer = loadBalancer
+			service.Status.LoadBalancer = lbStatus
 			err := r.Status().Update(ctx, service)
 			if err != nil {
-				log.Error(err, "Failed to update Service LoadBalancer status")
+				if apierrs.IsConflict(err) {
+					log.Info("retry applying changes to the latest Service version")
+				} else {
+					log.Error(err, "failed to update Service LoadBalancer status")
+				}
 				return ctrl.Result{}, err
 			}
 		}
 	}
-
 	return ctrl.Result{}, nil
 }
 
@@ -230,39 +300,111 @@ func (r *ServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func getMachineIP() (string, error) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return "", err
-	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 {
-			continue // interface down
-		}
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue // loopback interface
-		}
-		addrs, err := iface.Addrs()
+// initialize machine IP
+func initMachineIP(log logr.Logger) error {
+	if len(machineIP) == 0 {
+		ifaces, err := net.Interfaces()
 		if err != nil {
-			return "", err
+			return err
 		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 {
+				continue // interface down
 			}
-			if ip == nil || ip.IsLoopback() {
-				continue
+			if iface.Flags&net.FlagLoopback != 0 {
+				continue // loopback interface
 			}
-			ip = ip.To4()
-			if ip == nil {
-				continue // not an ipv4 address
+			addrs, err := iface.Addrs()
+			if err != nil {
+				return err
 			}
-			return ip.String(), nil
+			for _, addr := range addrs {
+				var ip net.IP
+				switch v := addr.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip == nil || ip.IsLoopback() {
+					continue
+				}
+				ip = ip.To4()
+				if ip == nil {
+					continue // not an ipv4 address
+				}
+				machineIP = ip.String()
+				log.Info(fmt.Sprintf("machine IP:%s", machineIP))
+				return nil
+			}
+		}
+		return errors.New("no IP found")
+	}
+	return nil
+}
+
+// delete any external resources associated with the Service
+// Ensure that delete implementation is idempotent and safe to invoke
+// multiple times for same object.
+func (r *ServiceReconciler) finalizeService(key string) (err error) {
+	if server, ok := getServer(key); ok {
+		err = server.stop()
+		if err != nil {
+			return
+		}
+		deleteServer(key)
+	}
+	return
+}
+
+// updating Server with minikubeIP & nodePort
+func updateServer(log logr.Logger, server *Server, minikubeIP string, nodePort int32) {
+	// update minikubeIP
+	if server.minikubeIP != minikubeIP {
+		log.Info(fmt.Sprintf("updating minikube IP from %s to %s", server.minikubeIP, minikubeIP))
+		server.minikubeIP = minikubeIP
+	}
+	// update nodePort
+	if nodePort > 0 {
+		if server.nodePort != nodePort {
+			log.Info(fmt.Sprintf("updating node port from %d to %d", server.nodePort, nodePort))
+			server.nodePort = nodePort
 		}
 	}
-	return "", fmt.Errorf("no IP found")
+}
+
+// create & start Server
+func createServer(ctx context.Context, log logr.Logger, minikubeIP string, nodePort int32, key string) error {
+	server := &Server{
+		log:        log.WithName("server"),
+		dialer:     net.Dialer{KeepAlive: 0},
+		minikubeIP: minikubeIP,
+		nodePort:   nodePort,
+	}
+	// propagate the context to the server
+	server.ctx, server.cancel = context.WithCancel(ctx)
+	// listener
+	listenCfg := &net.ListenConfig{KeepAlive: 0}
+	var err error
+	server.listener, err = listenCfg.Listen(server.ctx, "tcp", fmt.Sprintf("%s:0", machineIP))
+	if err != nil {
+		log.Error(err, fmt.Sprintf("listen on %s:0", machineIP))
+		return err
+	}
+	tcpAddr, ok := server.listener.Addr().(*net.TCPAddr)
+	if !ok {
+		err = fmt.Errorf("not a TCPAddr: %T", server.listener.Addr())
+		log.Error(err, "unexpected listener")
+		return err
+	}
+	server.port = tcpAddr.Port
+	log.Info(fmt.Sprintf("dynamically allocated port: %d", server.port))
+	addServer(key, server)
+	server.wg.Add(1)
+	go server.serve()
+	go func() {
+		// wait for context done (e.g. Ctrl-C SIGINT) & cleanup Server resources
+		_ = server.cleanup(ctx)
+	}()
+	return nil
 }
