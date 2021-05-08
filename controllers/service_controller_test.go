@@ -23,23 +23,37 @@ import (
 
 var _ = Describe("Kubernetes operator - controller test", func() {
 
-	const targetPort = 8080
+	const sleepTime = 3 * time.Second
 
 	var (
-		err    error
-		ctx    context.Context
-		mgrCtx context.Context
-		cancel context.CancelFunc
-		name   string
-		depl   *appsv1.Deployment
-		srv    *corev1.Service
-		mgr    manager.Manager
+		err            error
+		ctx            context.Context
+		mgrCtx         context.Context
+		cancel         context.CancelFunc
+		name           string
+		namespacedName types.NamespacedName
+		depl           *appsv1.Deployment
+		srv            *corev1.Service
+		mgr            manager.Manager
 	)
 
 	BeforeEach(func() {
-		ctx = context.Background()
-		mgrCtx, cancel = context.WithCancel(ctx)
 		name = "hello-minikube-test"
+		namespacedName = types.NamespacedName{Name: name, Namespace: "default"}
+		ctx = context.Background()
+		mgrCtx, cancel = context.WithCancel(context.Background())
+		By("init manager")
+		mgr, err = initManager()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(mgr).NotTo(BeNil())
+		By("init controller")
+		err = initControllers(mgr)
+		Expect(err).ToNot(HaveOccurred())
+		By("start manager")
+		go func() {
+			err = mgr.Start(mgrCtx)
+			Expect(err).ToNot(HaveOccurred())
+		}()
 		depl = initDeployment(name, 1)
 		By(fmt.Sprintf("create %s deployment", name))
 		err = k8sClient.Create(ctx, depl)
@@ -48,6 +62,7 @@ var _ = Describe("Kubernetes operator - controller test", func() {
 		By(fmt.Sprintf("expose %s deployment", name))
 		err = k8sClient.Create(ctx, srv)
 		Expect(err).ToNot(HaveOccurred())
+		time.Sleep(sleepTime)
 	})
 
 	AfterEach(func() {
@@ -57,61 +72,43 @@ var _ = Describe("Kubernetes operator - controller test", func() {
 		By(fmt.Sprintf("delete %s deployment", name))
 		err = k8sClient.Delete(ctx, depl)
 		Expect(err).ToNot(HaveOccurred())
-		time.Sleep(3 * time.Second)
+		time.Sleep(sleepTime)
 		By("stop manager")
 		cancel()
 	})
 
-	JustBeforeEach(func() {
-		By("init manager")
-		scheme := runtime.NewScheme()
-		utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-		utilruntime.Must(corev1.AddToScheme(scheme))
-		mgr, err = ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-			Scheme:                 scheme,
-			MetricsBindAddress:     ":8080",
-			Port:                   9443,
-			HealthProbeBindAddress: ":8081",
-			LeaderElection:         false,
-		})
-		Expect(err).ToNot(HaveOccurred())
-		Expect(mgr).NotTo(BeNil())
-		By("init controller")
-		err = (&ServiceReconciler{
-			Client: mgr.GetClient(),
-			Log:    ctrl.Log.WithName("controllers").WithName("Service"),
-			Scheme: mgr.GetScheme(),
-		}).SetupWithManager(mgr)
-		Expect(err).ToNot(HaveOccurred())
-		By("start manager")
-		go func() {
-			err = mgr.Start(mgrCtx)
-			Expect(err).ToNot(HaveOccurred())
-		}()
-		time.Sleep(time.Second)
-	})
-
 	It("should access exposed deployment", func() {
-		var resp *http.Response
-		var content []byte
-		namespacedName := types.NamespacedName{Name: name, Namespace: "default"}
 		s := corev1.Service{}
-		err = k8sClient.Get(ctx, namespacedName, &s)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(s).NotTo(BeNil())
-		Expect(len(s.Status.LoadBalancer.Ingress)).To(Equal(1))
-		Expect(s.Status.LoadBalancer.Ingress[0].IP).NotTo(BeEmpty())
-		srv, ok := getServer(namespacedName.String())
-		Expect(ok).To(BeTrue())
-		Expect(srv).NotTo(BeNil())
-		resp, err = http.Get(fmt.Sprintf("http://%s:%d", s.Status.LoadBalancer.Ingress[0].IP, srv.port))
-		Expect(err).ToNot(HaveOccurred())
-		Expect(resp.StatusCode).To(Equal(http.StatusOK))
-		content, err = ioutil.ReadAll(resp.Body)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(string(content)).To(ContainSubstring("host=%s:%d", s.Status.LoadBalancer.Ingress[0].IP, srv.port))
+		getService(ctx, namespacedName, &s)
+		accessExposedDeployment(s.Status.LoadBalancer.Ingress[0].IP, getSrv(namespacedName).port)
 	})
 
+	Context("When the service node port changes", func() {
+
+		var (
+			nodePort int32
+			port     int
+			lbIP     string
+		)
+
+		BeforeEach(func() {
+			s := corev1.Service{}
+			getService(ctx, namespacedName, &s)
+			lbIP = s.Status.LoadBalancer.Ingress[0].IP
+			port = getSrv(namespacedName).port
+			accessExposedDeployment(lbIP, port)
+			Expect(len(s.Spec.Ports) > 0 && s.Spec.Ports[0].NodePort > 0).To(BeTrue())
+			nodePort = s.Spec.Ports[0].NodePort - 1 // assume the preceding port will be free
+			s.Spec.Ports[0].NodePort = nodePort
+			err = k8sClient.Update(ctx, &s)
+			Expect(err).NotTo(HaveOccurred())
+			time.Sleep(sleepTime)
+		})
+
+		It("should access exposed deployment", func() {
+			accessExposedDeployment(lbIP, port)
+		})
+	})
 })
 
 func initDeployment(name string, replicas int) *appsv1.Deployment {
@@ -145,4 +142,61 @@ func initLoadBalancerService(name string, port, targetPort int) *corev1.Service 
 			Type:     corev1.ServiceTypeLoadBalancer,
 		},
 	}
+}
+
+func initManager() (mgr manager.Manager, err error) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	mgr, err = ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		Scheme:                 scheme,
+		MetricsBindAddress:     ":8080",
+		Port:                   9443,
+		HealthProbeBindAddress: ":8081",
+		LeaderElection:         false,
+	})
+	return
+}
+
+func initControllers(mgr manager.Manager) (err error) {
+	if err = (&ServiceReconciler{
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("controllers").WithName("Service"),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		return
+	}
+	err = (&NodeReconciler{
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("controllers").WithName("Node"),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr)
+	return
+}
+
+func getService(ctx context.Context, namespacedName types.NamespacedName, s *corev1.Service) {
+	err := k8sClient.Get(ctx, namespacedName, s)
+	Expect(err).ToNot(HaveOccurred())
+	Expect(s).NotTo(BeNil())
+	Expect(len(s.Status.LoadBalancer.Ingress)).To(Equal(1))
+	Expect(s.Status.LoadBalancer.Ingress[0].IP).NotTo(BeEmpty())
+	Expect(s.Finalizers).To(ContainElement(serviceFinalizer))
+}
+
+func getSrv(namespacedName types.NamespacedName) *Server {
+	srv, ok := getServer(namespacedName.String())
+	Expect(ok).To(BeTrue())
+	Expect(srv).NotTo(BeNil())
+	Expect(srv.port > 0).To(BeTrue())
+	return srv
+}
+
+func accessExposedDeployment(ip string, port int) {
+	resp, err := http.Get(fmt.Sprintf("http://%s:%d", ip, port))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(resp.StatusCode).To(Equal(http.StatusOK))
+	content, err := ioutil.ReadAll(resp.Body)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(string(content)).To(ContainSubstring("host=%s:%d", ip, port))
+	err = resp.Body.Close()
+	Expect(err).NotTo(HaveOccurred())
 }

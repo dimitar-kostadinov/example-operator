@@ -83,7 +83,7 @@ type Server struct {
 // start listening on machineIP : port
 func (s *Server) serve() {
 	defer s.wg.Done()
-	s.log.Info(fmt.Sprintf("server listen on port %d", s.port))
+	s.log.Info(fmt.Sprintf("listen on port %d", s.port))
 	for {
 		c, err := s.listener.Accept()
 		if err != nil {
@@ -125,9 +125,10 @@ func (s *Server) handler(c net.Conn) {
 		}
 	}()
 	// forward target > connection
+	isConnEOF := false
 	go func() {
 		_, err = io.Copy(target, c)
-		if err != nil {
+		if err != nil && !isConnEOF {
 			log.Error(err, "copy from target to connection")
 		}
 	}()
@@ -136,6 +137,7 @@ func (s *Server) handler(c net.Conn) {
 	if err != nil {
 		log.Error(err, "copy from connection to target")
 	}
+	isConnEOF = true
 }
 
 // stop the server
