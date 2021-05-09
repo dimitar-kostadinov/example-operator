@@ -124,20 +124,31 @@ func (s *Server) handler(c net.Conn) {
 			log.Error(err, "close target connection")
 		}
 	}()
-	// forward target > connection
-	isConnEOF := false
+	// forwarding
+	isDone := false
+	ctDone := make(chan struct{})
+	tcDone := make(chan struct{})
+	// forward connection > target
 	go func() {
+		defer close(ctDone)
 		_, err = io.Copy(target, c)
-		if err != nil && !isConnEOF {
+		if err != nil && !isDone {
+			log.Error(err, "copy from connection to target")
+		}
+	}()
+	// forward target > connection
+	go func() {
+		defer close(tcDone)
+		_, err = io.Copy(c, target)
+		if err != nil && !isDone {
 			log.Error(err, "copy from target to connection")
 		}
 	}()
-	// forward connection > target
-	_, err = io.Copy(c, target)
-	if err != nil {
-		log.Error(err, "copy from connection to target")
+	select {
+	case <-ctDone: // read from client done
+	case <-tcDone: // read from nginx done
 	}
-	isConnEOF = true
+	isDone = true
 }
 
 // stop the server
