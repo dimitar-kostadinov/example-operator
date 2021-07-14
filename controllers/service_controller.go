@@ -57,13 +57,13 @@ func getServer(key string) (srv *Server, ok bool) {
 
 func addServer(key string, srv *Server) {
 	mux.Lock()
-	mux.Unlock()
+	defer mux.Unlock()
 	servers[key] = srv
 }
 
 func deleteServer(key string) {
 	mux.Lock()
-	mux.Unlock()
+	defer mux.Unlock()
 	delete(servers, key)
 }
 
